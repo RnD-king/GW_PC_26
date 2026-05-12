@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import platform
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -34,12 +35,19 @@ def _is_jetson_target() -> bool:
     return platform.machine() in ("aarch64", "arm64")
 
 
-def _runtime_path(env_name: str, pc_key: str, jetson_key: str) -> str:
+def _runtime_path_from_keys(
+    env_name: str,
+    pc_keys: Sequence[str],
+    jetson_keys: Sequence[str],
+) -> str:
     env_path = os.environ.get(env_name)
     if env_path:
         return env_path
     params = _runtime_params()
-    keys = (jetson_key, pc_key) if _is_jetson_target() else (pc_key, jetson_key)
+    if _is_jetson_target():
+        keys = tuple(jetson_keys) + tuple(pc_keys)
+    else:
+        keys = tuple(pc_keys) + tuple(jetson_keys)
     for key in keys:
         value = params.get(key)
         if value and Path(value).expanduser().is_file():
@@ -48,19 +56,39 @@ def _runtime_path(env_name: str, pc_key: str, jetson_key: str) -> str:
         value = params.get(key)
         if value:
             return str(Path(value).expanduser())
-    raise FileNotFoundError(f"Missing {pc_key}/{jetson_key} in {_runtime_config_path()}")
+    raise FileNotFoundError(f"Missing one of {keys} in {_runtime_config_path()}")
 
 
-DEFAULT_POLICY_CKPT = _runtime_path(
-    "G1_POLICY_CKPT",
-    "pc_policy_checkpoint",
-    "jetson_policy_checkpoint",
+def _runtime_path(env_name: str, pc_key: str, jetson_key: str) -> str:
+    return _runtime_path_from_keys(env_name, (pc_key,), (jetson_key,))
+
+
+DEFAULT_PPO_POLICY_CKPT = _runtime_path_from_keys(
+    "G1_PPO_POLICY_CKPT",
+    ("pc_ppo_policy_checkpoint", "pc_policy_checkpoint"),
+    ("jetson_ppo_policy_checkpoint", "jetson_policy_checkpoint"),
 )
-DEFAULT_OBS_NORM_CKPT = _runtime_path(
+DEFAULT_BC_POLICY_CKPT = _runtime_path_from_keys(
+    "G1_BC_POLICY_CKPT",
+    ("pc_bc_checkpoint", "pc_bc_policy_checkpoint", "pc_obs_norm_ckpt"),
+    ("jetson_bc_checkpoint", "jetson_bc_policy_checkpoint", "jetson_obs_norm_ckpt"),
+)
+DEFAULT_OBS_NORM_CKPT = _runtime_path_from_keys(
     "G1_OBS_NORM_CKPT",
-    "pc_obs_norm_ckpt",
-    "jetson_obs_norm_ckpt",
+    ("pc_obs_norm_ckpt", "pc_bc_checkpoint", "pc_bc_policy_checkpoint"),
+    ("jetson_obs_norm_ckpt", "jetson_bc_checkpoint", "jetson_bc_policy_checkpoint"),
 )
+
+
+def _default_policy_checkpoint(policy_mode: str) -> str:
+    generic_env = os.environ.get("G1_POLICY_CKPT")
+    if generic_env:
+        return generic_env
+    if policy_mode == "bc":
+        return DEFAULT_BC_POLICY_CKPT
+    if policy_mode == "ppo":
+        return DEFAULT_PPO_POLICY_CKPT
+    raise ValueError("policy_mode must be one of: ppo, bc")
 
 BASE_FEATURE_NAMES = [
     "u_err_near",
@@ -203,7 +231,8 @@ class HighLevelPolicyNode(Node):
 
         self.declare_parameter("features_topic", "/g1_vision/features")
         self.declare_parameter("cmd_topic", "/g1_vision/cmd_vel")
-        self.declare_parameter("policy_checkpoint", DEFAULT_POLICY_CKPT)
+        self.declare_parameter("policy_mode", "ppo")
+        self.declare_parameter("policy_checkpoint", "")
         self.declare_parameter("checkpoint_kind", "auto")
         self.declare_parameter("obs_norm_ckpt", DEFAULT_OBS_NORM_CKPT)
         self.declare_parameter("obs_norm_mode", "bc")
@@ -220,6 +249,8 @@ class HighLevelPolicyNode(Node):
         self.declare_parameter("stale_wz", 0.0)
         self.declare_parameter("obs_norm_clip", 8.0)
         self.declare_parameter("device", "cpu")
+        self.declare_parameter("log_cycle_timing", True)
+        self.declare_parameter("cycle_timing_log_period_sec", 1.0)
 
         self.features_topic = str(self.get_parameter("features_topic").value)
         self.cmd_topic = str(self.get_parameter("cmd_topic").value)
@@ -238,11 +269,19 @@ class HighLevelPolicyNode(Node):
         self.stale_vx = float(self.get_parameter("stale_vx").value)
         self.stale_wz = float(self.get_parameter("stale_wz").value)
         self.obs_norm_clip = float(self.get_parameter("obs_norm_clip").value)
+        self.log_cycle_timing = bool(self.get_parameter("log_cycle_timing").value)
+        self.cycle_timing_log_period_sec = float(
+            self.get_parameter("cycle_timing_log_period_sec").value
+        )
 
         device_name = str(self.get_parameter("device").value)
         self.device = torch.device(device_name if torch.cuda.is_available() or device_name == "cpu" else "cpu")
 
-        policy_checkpoint = str(self.get_parameter("policy_checkpoint").value)
+        self.policy_mode = str(self.get_parameter("policy_mode").value).lower()
+        if self.policy_mode not in ("ppo", "bc"):
+            raise ValueError("policy_mode must be one of: ppo, bc")
+        policy_checkpoint_param = str(self.get_parameter("policy_checkpoint").value).strip()
+        policy_checkpoint = policy_checkpoint_param or _default_policy_checkpoint(self.policy_mode)
         checkpoint_kind = str(self.get_parameter("checkpoint_kind").value)
         hidden_dims = _parse_dims(str(self.get_parameter("hidden_dims").value))
         self.model = load_policy_model(
@@ -277,6 +316,8 @@ class HighLevelPolicyNode(Node):
         self.pub_count = 0
         self._last_stale_warn_ns = 0
         self._last_cmd_log_ns = 0
+        self._last_timing_log_ns = 0
+        self._last_timer_perf = None
 
         self.feature_sub = self.create_subscription(
             Float32MultiArray,
@@ -292,7 +333,9 @@ class HighLevelPolicyNode(Node):
         self.get_logger().info("g1_vision policy node started.")
         self.get_logger().info(f"  features_topic : {self.features_topic}")
         self.get_logger().info(f"  cmd_topic      : {self.cmd_topic}")
+        self.get_logger().info(f"  policy_mode    : {self.policy_mode}")
         self.get_logger().info(f"  policy_ckpt    : {policy_checkpoint}")
+        self.get_logger().info(f"  checkpoint_kind: {checkpoint_kind}")
         self.get_logger().info(f"  obs_norm_mode  : {self.obs_norm_mode}")
         self.get_logger().info(f"  obs_dim        : {self.obs_dim}")
         self.get_logger().info(f"  publish_hz     : {self.publish_hz:.2f}")
@@ -332,30 +375,97 @@ class HighLevelPolicyNode(Node):
         return True
 
     def _on_timer(self) -> None:
-        if self._feature_is_stale():
+        t_start = time.perf_counter()
+        last_timer_perf = self._last_timer_perf
+        self._last_timer_perf = t_start
+        cycle_interval_sec = 0.0 if last_timer_perf is None else t_start - last_timer_perf
+        is_stale = self._feature_is_stale()
+        t_stale_check = time.perf_counter()
+
+        if is_stale:
             if self.publish_zero_before_first or self.latest_feature is not None:
                 self._publish_stale_cmd()
+            t_publish = time.perf_counter()
             if self._should_log("_last_stale_warn_ns", 1.0):
                 self.get_logger().warn(
                     "No fresh /g1_vision/features. Publishing stale fallback command."
                 )
+            self._log_cycle_timing(
+                stale_check_sec=t_stale_check - t_start,
+                history_sec=0.0,
+                tensor_sec=0.0,
+                norm_sec=0.0,
+                inference_sec=0.0,
+                publish_sec=t_publish - t_stale_check,
+                total_sec=t_publish - t_start,
+                cycle_interval_sec=cycle_interval_sec,
+                stale=True,
+            )
             return
 
         obs_np = self.history.update(self.latest_feature)
+        t_history = time.perf_counter()
         obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        t_tensor = time.perf_counter()
         if self.obs_norm_mode == "bc":
             obs = (obs - self.obs_mean) / torch.clamp(self.obs_std, min=1e-6)
             obs = torch.clamp(obs, -self.obs_norm_clip, self.obs_norm_clip)
+        t_norm = time.perf_counter()
 
         with torch.no_grad():
             action = self.model(obs).squeeze(0).detach().cpu().numpy()
+        t_inference = time.perf_counter()
 
         vx = float(np.clip(action[0], self.vx_min, self.vx_max))
         wz = float(np.clip(action[1], self.wz_min, self.wz_max))
         self._publish_cmd(vx, wz)
+        t_publish = time.perf_counter()
 
         if self._should_log("_last_cmd_log_ns", 1.0):
             self.get_logger().info(f"cmd vx={vx:.3f} wz={wz:.3f}")
+        self._log_cycle_timing(
+            stale_check_sec=t_stale_check - t_start,
+            history_sec=t_history - t_stale_check,
+            tensor_sec=t_tensor - t_history,
+            norm_sec=t_norm - t_tensor,
+            inference_sec=t_inference - t_norm,
+            publish_sec=t_publish - t_inference,
+            total_sec=t_publish - t_start,
+            cycle_interval_sec=cycle_interval_sec,
+            stale=False,
+        )
+
+    def _log_cycle_timing(
+        self,
+        *,
+        stale_check_sec: float,
+        history_sec: float,
+        tensor_sec: float,
+        norm_sec: float,
+        inference_sec: float,
+        publish_sec: float,
+        total_sec: float,
+        cycle_interval_sec: float,
+        stale: bool,
+    ) -> None:
+        if not self.log_cycle_timing:
+            return
+        if self.cycle_timing_log_period_sec > 0.0 and not self._should_log(
+            "_last_timing_log_ns", self.cycle_timing_log_period_sec
+        ):
+            return
+        self.get_logger().info(
+            "cycle timing "
+            f"stale={stale} "
+            f"interval={cycle_interval_sec * 1000.0:.3f}ms "
+            f"total={total_sec * 1000.0:.3f}ms "
+            f"stale_check={stale_check_sec * 1000.0:.3f}ms "
+            f"history={history_sec * 1000.0:.3f}ms "
+            f"tensor={tensor_sec * 1000.0:.3f}ms "
+            f"norm={norm_sec * 1000.0:.3f}ms "
+            f"infer={inference_sec * 1000.0:.3f}ms "
+            f"publish={publish_sec * 1000.0:.3f}ms"
+        )
 
 
 def main(args: Iterable[str] | None = None) -> None:
