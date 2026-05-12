@@ -529,6 +529,15 @@ private:
                     cv::Scalar(255, 255, 255), 2);
       }
 
+      // ===== Policy command overlay =====
+      {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "CMD: vx=%.3f m/s | wz=%.3f rad/s",
+                      vx_prev_, wz_prev_);
+        cv::putText(vis, buf, cv::Point(10, 120), cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                    cv::Scalar(0, 200, 255), 2);
+      }
+
       cv::imshow(kDebugWindowName, vis);
       cv::waitKey(1);
     }
