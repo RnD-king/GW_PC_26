@@ -1,0 +1,12 @@
+enable_color: true
+rgb_camera.color_profile: 640,480,15
+rgb_camera.color_format: RGB8
+rgb_camera.enable_auto_exposure: false
+rgb_camera.exposure: 155
+rgb_camera.enable_auto_white_balance: false
+rgb_camera.white_balance: 4200.0
+rgb_camera.saturation: 55
+rgb_camera.contrast: 55
+rgb_camera.gamma: 300
+rgb_camera.sharpness: 30
+rgb_camera.gain: 64
